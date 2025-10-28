@@ -19,6 +19,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o corsproxy .
 # Final stage - minimal Debian slim image
 FROM debian:bookworm-slim
 
+# Add OCI labels for GitHub Container Registry
+LABEL org.opencontainers.image.source=https://github.com/abdusco/corsproxy
+LABEL org.opencontainers.image.description="Lightweight CORS proxy server built with Go"
+LABEL org.opencontainers.image.licenses=MIT
+
 # Install ca-certificates and wget for HTTPS requests and health checks
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates wget && \
