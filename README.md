@@ -22,9 +22,12 @@ fetch('http://localhost:8080/https://api.example.com/data')
 go build && ./corsproxy
 # Server starts on http://localhost:8080
 
-# With Docker
+# With Docker (build locally)
 docker build -t corsproxy .
 docker run -p 8080:8080 corsproxy
+
+# With pre-built image from GitHub Container Registry
+docker run -p 8080:8080 ghcr.io/abdusco/corsproxy:latest
 ```
 
 ## Deployment
