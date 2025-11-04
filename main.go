@@ -41,9 +41,15 @@ func (cp *CORSProxy) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 		origin = "*"
 	}
 
+	defaultAllowedHeaders := []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "X-Requested-With"}
+	requestedHeaders := r.Header.Get("Access-Control-Request-Headers")
+	allowHeaders := combineAllowedHeaders(defaultAllowedHeaders, requestedHeaders)
+
 	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Add("Vary", "Origin")
+	w.Header().Add("Vary", "Access-Control-Request-Headers")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
-	w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token, X-Requested-With")
+	w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
 	w.Header().Set("Access-Control-Max-Age", "3600")
 }
@@ -192,6 +198,37 @@ func isHopByHopHeader(header string) bool {
 		}
 	}
 	return false
+}
+
+func combineAllowedHeaders(defaults []string, requested string) string {
+	headerSet := make(map[string]struct{})
+	var combined []string
+
+	addHeader := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		canonical := http.CanonicalHeaderKey(h)
+		key := strings.ToLower(canonical)
+		if _, exists := headerSet[key]; exists {
+			return
+		}
+		headerSet[key] = struct{}{}
+		combined = append(combined, canonical)
+	}
+
+	for _, h := range defaults {
+		addHeader(h)
+	}
+
+	if requested != "" {
+		for _, h := range strings.Split(requested, ",") {
+			addHeader(h)
+		}
+	}
+
+	return strings.Join(combined, ", ")
 }
 
 func (cp *CORSProxy) handleHealth(w http.ResponseWriter, r *http.Request) {
