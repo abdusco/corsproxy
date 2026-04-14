@@ -157,9 +157,9 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers
 	cp.setCORSHeaders(w, r)
 
-	// Copy response headers (excluding hop-by-hop headers)
+	// Copy response headers (excluding hop-by-hop and CORS headers)
 	for name, values := range resp.Header {
-		if isHopByHopHeader(name) {
+		if isHopByHopHeader(name) || isCORSHeader(name) {
 			continue
 		}
 		for _, value := range values {
@@ -180,22 +180,29 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func isHopByHopHeader(header string) bool {
-	hopByHopHeaders := []string{
-		"Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Te",
-		"Trailers",
-		"Transfer-Encoding",
-		"Upgrade",
+	switch strings.ToLower(header) {
+	case "connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailers",
+		"transfer-encoding",
+		"upgrade":
+		return true
 	}
+	return false
+}
 
-	header = strings.ToLower(header)
-	for _, h := range hopByHopHeaders {
-		if strings.ToLower(h) == header {
-			return true
-		}
+func isCORSHeader(header string) bool {
+	switch strings.ToLower(header) {
+	case "access-control-allow-origin",
+		"access-control-allow-methods",
+		"access-control-allow-headers",
+		"access-control-allow-credentials",
+		"access-control-max-age",
+		"access-control-expose-headers":
+		return true
 	}
 	return false
 }
