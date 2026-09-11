@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -100,13 +101,84 @@ func (cp *CORSProxy) extractTargetURL(path string) (string, error) {
 	return targetURL.String(), nil
 }
 
+func (cp *CORSProxy) extractRequestTarget(r *http.Request) (string, bool, error) {
+	if target := r.URL.Query().Get("url"); target != "" {
+		validated, err := cp.extractTargetURL(target)
+		return validated, true, err
+	}
+
+	validated, err := cp.extractTargetURL(r.URL.Path)
+	return validated, false, err
+}
+
+func parseExtraHeaders(raw string) (http.Header, error) {
+	var entries []string
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("extra_headers must be a JSON list of strings: %w", err)
+	}
+	if entries == nil && strings.TrimSpace(raw) != "[]" {
+		return nil, fmt.Errorf("extra_headers must be a JSON list of strings")
+	}
+
+	headers := make(http.Header)
+	for _, entry := range entries {
+		separator := strings.IndexByte(entry, ':')
+		if separator <= 0 {
+			return nil, fmt.Errorf("invalid extra header %q: expected 'Header: value'", entry)
+		}
+
+		name := strings.TrimSpace(entry[:separator])
+		value := strings.TrimSpace(entry[separator+1:])
+		if !validHeaderName(name) {
+			return nil, fmt.Errorf("invalid extra header name %q", name)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("invalid newline in value for extra header %q", name)
+		}
+		if isHopByHopHeader(name) || strings.EqualFold(name, "Content-Length") {
+			return nil, fmt.Errorf("transport header %q cannot be supplied via extra_headers", name)
+		}
+
+		// Set makes command headers take precedence over the browser's copy
+		// of the same header (useful for Cookie, Origin, and Referer).
+		headers.Set(name, value)
+	}
+
+	return headers, nil
+}
+
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
-	// Extract target URL from path
-	targetURL, err := cp.extractTargetURL(r.URL.Path)
+	// Extract target URL from either the legacy path or ?url=<encoded URL>.
+	targetURL, queryCommand, err := cp.extractRequestTarget(r)
 	if err != nil {
 		slog.Warn("Invalid URL request", "path", r.URL.Path, "error", err, "remote_addr", r.RemoteAddr)
 		http.Error(w, fmt.Sprintf("Invalid URL: %v", err), http.StatusBadRequest)
 		return
+	}
+
+	var extraHeaders http.Header
+	if raw := r.URL.Query().Get("extra_headers"); raw != "" {
+		extraHeaders, err = parseExtraHeaders(raw)
+		if err != nil {
+			slog.Warn("Invalid extra headers", "path", r.URL.Path, "error", err, "remote_addr", r.RemoteAddr)
+			http.Error(w, fmt.Sprintf("Invalid extra_headers: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 
 	slog.Info("Proxying request", "method", r.Method, "target", targetURL)
@@ -119,9 +191,17 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy query parameters
-	if r.URL.RawQuery != "" {
-		proxyReq.URL.RawQuery = r.URL.RawQuery
+	// In legacy path mode, copy query parameters to the target. In query
+	// command mode, url already contains the target's complete query string;
+	// forwarding RawQuery would leak url and extra_headers to the target.
+	if !queryCommand && r.URL.RawQuery != "" {
+		if r.URL.Query().Get("extra_headers") == "" {
+			proxyReq.URL.RawQuery = r.URL.RawQuery
+		} else {
+			targetQuery := r.URL.Query()
+			targetQuery.Del("extra_headers")
+			proxyReq.URL.RawQuery = targetQuery.Encode()
+		}
 	}
 
 	// Copy headers (excluding hop-by-hop headers)
@@ -132,6 +212,16 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, value := range values {
 			proxyReq.Header.Add(name, value)
+		}
+	}
+
+	for name, values := range extraHeaders {
+		for _, value := range values {
+			if strings.EqualFold(name, "Host") {
+				proxyReq.Host = value
+			} else {
+				proxyReq.Header.Set(name, value)
+			}
 		}
 	}
 
@@ -246,7 +336,7 @@ func (cp *CORSProxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cp *CORSProxy) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/" {
+	if r.URL.Path == "/" && r.URL.Query().Get("url") == "" {
 		cp.setCORSHeaders(w, r)
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)

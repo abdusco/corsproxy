@@ -15,6 +15,30 @@ curl http://localhost:8080/http://example.com/users
 fetch('http://localhost:8080/https://api.example.com/data')
 ```
 
+### Query command mode
+
+The target URL can also be supplied as the encoded `url` query parameter. Use
+`extra_headers` for a JSON-encoded list of `Header: value` strings. These
+headers are applied to the outgoing request and override incoming headers with
+the same name.
+
+```bash
+curl --get http://localhost:8080/ \
+  --data-urlencode 'url=https://api.example.com/data?source=browser' \
+  --data-urlencode 'extra_headers=["X-Example: value"]'
+```
+
+```javascript
+const params = new URLSearchParams({
+  url: 'https://api.example.com/data?source=browser',
+  extra_headers: JSON.stringify(['X-Example: value']),
+});
+fetch(`http://localhost:8080/?${params}`);
+```
+
+Hop-by-hop headers and `Content-Length` are rejected. Do not put secrets in
+URLs when avoidable, because URLs may be retained in browser or server logs.
+
 ## Quick Start
 
 ```bash
