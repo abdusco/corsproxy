@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,8 +12,10 @@ import (
 )
 
 const (
-	defaultPort    = "8080"
-	maxRequestSize = 100 << 20 // 100MB
+	defaultPort          = "8080"
+	maxRequestSize       = 100 << 20 // 100MB
+	requestHeaderPrefix  = "X-Req-"
+	responseHeaderPrefix = "X-Res-"
 )
 
 type CORSProxy struct {
@@ -111,55 +112,53 @@ func (cp *CORSProxy) extractRequestTarget(r *http.Request) (string, bool, error)
 	return validated, false, err
 }
 
-func parseExtraHeaders(raw string) (http.Header, error) {
-	var entries []string
-	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-		return nil, fmt.Errorf("extra_headers must be a JSON list of strings: %w", err)
-	}
-	if entries == nil && strings.TrimSpace(raw) != "[]" {
-		return nil, fmt.Errorf("extra_headers must be a JSON list of strings")
-	}
-
-	headers := make(http.Header)
-	for _, entry := range entries {
-		separator := strings.IndexByte(entry, ':')
-		if separator <= 0 {
-			return nil, fmt.Errorf("invalid extra header %q: expected 'Header: value'", entry)
-		}
-
-		name := strings.TrimSpace(entry[:separator])
-		value := strings.TrimSpace(entry[separator+1:])
-		if !validHeaderName(name) {
-			return nil, fmt.Errorf("invalid extra header name %q", name)
-		}
-		if strings.ContainsAny(value, "\r\n") {
-			return nil, fmt.Errorf("invalid newline in value for extra header %q", name)
-		}
-		if isHopByHopHeader(name) || strings.EqualFold(name, "Content-Length") {
-			return nil, fmt.Errorf("transport header %q cannot be supplied via extra_headers", name)
-		}
-
-		// Set makes command headers take precedence over the browser's copy
-		// of the same header (useful for Cookie, Origin, and Referer).
-		headers.Set(name, value)
-	}
-
-	return headers, nil
-}
-
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+func prefixedHeaderOverrides(headers http.Header, prefix string) (http.Header, error) {
+	overrides := make(http.Header)
+	lowerPrefix := strings.ToLower(prefix)
+	for name, values := range headers {
+		if !strings.HasPrefix(strings.ToLower(name), lowerPrefix) {
 			continue
 		}
-		return false
+
+		targetName := name[len(prefix):]
+		if targetName == "" {
+			return nil, fmt.Errorf("invalid %s header: missing target header name", name)
+		}
+		if isHopByHopHeader(targetName) || strings.EqualFold(targetName, "Content-Length") {
+			return nil, fmt.Errorf("transport header %q cannot be supplied via %s headers", targetName, prefix)
+		}
+
+		// A prefixed header is an explicit override. Preserve repeated values
+		// for headers that support them, while keeping them out of the request
+		// sent to the proxy itself.
+		canonicalName := http.CanonicalHeaderKey(targetName)
+		if canonicalName == "" {
+			return nil, fmt.Errorf("invalid target header name %q", targetName)
+		}
+		if len(values) == 0 {
+			return nil, fmt.Errorf("header %q has no values", name)
+		}
+		for _, value := range values {
+			if strings.ContainsAny(value, "\r\n") {
+				return nil, fmt.Errorf("invalid newline in value for header %q", name)
+			}
+		}
+		overrides[canonicalName] = append([]string(nil), values...)
 	}
-	return true
+
+	return overrides, nil
+}
+
+func requestHeaderOverrides(headers http.Header) (http.Header, error) {
+	return prefixedHeaderOverrides(headers, requestHeaderPrefix)
+}
+
+func responseHeaderOverrides(headers http.Header) (http.Header, error) {
+	return prefixedHeaderOverrides(headers, responseHeaderPrefix)
+}
+
+func hasHeaderPrefix(name, prefix string) bool {
+	return strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix))
 }
 
 func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
@@ -171,14 +170,17 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var extraHeaders http.Header
-	if raw := r.URL.Query().Get("extra_headers"); raw != "" {
-		extraHeaders, err = parseExtraHeaders(raw)
-		if err != nil {
-			slog.Warn("Invalid extra headers", "path", r.URL.Path, "error", err, "remote_addr", r.RemoteAddr)
-			http.Error(w, fmt.Sprintf("Invalid extra_headers: %v", err), http.StatusBadRequest)
-			return
-		}
+	requestHeaders, err := requestHeaderOverrides(r.Header)
+	if err != nil {
+		slog.Warn("Invalid request header override", "path", r.URL.Path, "error", err, "remote_addr", r.RemoteAddr)
+		http.Error(w, fmt.Sprintf("Invalid request header override: %v", err), http.StatusBadRequest)
+		return
+	}
+	responseHeaders, err := responseHeaderOverrides(r.Header)
+	if err != nil {
+		slog.Warn("Invalid response header override", "path", r.URL.Path, "error", err, "remote_addr", r.RemoteAddr)
+		http.Error(w, fmt.Sprintf("Invalid response header override: %v", err), http.StatusBadRequest)
+		return
 	}
 
 	slog.Info("Proxying request", "method", r.Method, "target", targetURL)
@@ -193,21 +195,15 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	// In legacy path mode, copy query parameters to the target. In query
 	// command mode, url already contains the target's complete query string;
-	// forwarding RawQuery would leak url and extra_headers to the target.
+	// forwarding RawQuery would leak the proxy command to the target.
 	if !queryCommand && r.URL.RawQuery != "" {
-		if r.URL.Query().Get("extra_headers") == "" {
-			proxyReq.URL.RawQuery = r.URL.RawQuery
-		} else {
-			targetQuery := r.URL.Query()
-			targetQuery.Del("extra_headers")
-			proxyReq.URL.RawQuery = targetQuery.Encode()
-		}
+		proxyReq.URL.RawQuery = r.URL.RawQuery
 	}
 
 	// Copy headers (excluding hop-by-hop headers)
 	for name, values := range r.Header {
 		// Skip hop-by-hop headers
-		if isHopByHopHeader(name) {
+		if isHopByHopHeader(name) || hasHeaderPrefix(name, requestHeaderPrefix) || hasHeaderPrefix(name, responseHeaderPrefix) {
 			continue
 		}
 		for _, value := range values {
@@ -215,13 +211,14 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for name, values := range extraHeaders {
+	for name, values := range requestHeaders {
+		if strings.EqualFold(name, "Host") {
+			proxyReq.Host = values[len(values)-1]
+			continue
+		}
+		proxyReq.Header.Del(name)
 		for _, value := range values {
-			if strings.EqualFold(name, "Host") {
-				proxyReq.Host = value
-			} else {
-				proxyReq.Header.Set(name, value)
-			}
+			proxyReq.Header.Add(name, value)
 		}
 	}
 
@@ -252,6 +249,15 @@ func (cp *CORSProxy) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		if isHopByHopHeader(name) || isCORSHeader(name) {
 			continue
 		}
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+
+	// Apply client-supplied response headers after upstream headers so an
+	// X-Res-* header can add or override a response header.
+	for name, values := range responseHeaders {
+		w.Header().Del(name)
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
